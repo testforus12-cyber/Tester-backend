@@ -30,6 +30,10 @@ const STATIC_ALLOWED = [
   "http://localhost:3000",
   "http://localhost:5173",
   "https://tester-frontend-34h73mybs-testforus12-cybers-projects.vercel.app",
+  "http://127.0.0.1:3000",
+"http://localhost:5173",
+"http://127.0.0.1:5173",
+,
 ];
 
 // Optional: add more origins via env as a comma-separated list
