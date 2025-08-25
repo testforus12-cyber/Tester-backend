@@ -33,7 +33,8 @@ const STATIC_ALLOWED = [
   "http://127.0.0.1:3000",
 "http://localhost:5173",
 "http://127.0.0.1:5173",
-"https://newtesterfrontend.netlify.app/",
+"https://newtesterfrontend.netlify.app",
+"https://tester-frontend-bxo2-3h45p0xjm-testforus12-cybers-projects.vercel.app"
 ];
 
 // Optional: add more origins via env as a comma-separated list
