@@ -1,5 +1,9 @@
 {
+  "name": "tester-backend",
+  "version": "1.0.0",
   "type": "module",
+  "main": "index.js",
+  "engines": { "node": ">=20" },
   "dependencies": {
     "@prisma/client": "^6.11.0",
     "bcrypt": "^6.0.0",
@@ -22,6 +26,8 @@
     "xlsx": "^0.18.5"
   },
   "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
     "migrate": "node scripts/migratePriceKFactor.js",
     "upload-freight-rates": "node scripts/uploadFreightRates.js",
     "upload-wheelseye-pricing": "node scripts/uploadWheelseyePricing.js",
