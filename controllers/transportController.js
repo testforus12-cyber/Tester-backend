@@ -13,6 +13,18 @@ import pinMap from '../src/utils/pincodeMap.js';
 
 dotenv.config();
 
+/** Helper: robust access to zoneRates whether Map or plain object */
+function getUnitPriceFromChart(zoneRates, originZone, destZone) {
+  if (!zoneRates) return undefined;
+  if (typeof zoneRates.get === "function") {
+    const row = zoneRates.get(originZone);
+    return row ? row[destZone] : undefined;
+  }
+  // Plain object fallback
+  const row = zoneRates[originZone];
+  return row ? row[destZone] : undefined;
+}
+
 export const deletePackingList = async (req, res) => {
   try {
     const preset = await PackingList.findById(req.params.id);
@@ -92,6 +104,8 @@ export const calculatePrice = async (req, res) => {
     shipment_details,
   } = req.body;
 
+  const rid = req.id || "no-reqid";
+
   let actualWeight;
   if (Array.isArray(shipment_details) && shipment_details.length > 0) {
     actualWeight = shipment_details.reduce(
@@ -131,77 +145,161 @@ export const calculatePrice = async (req, res) => {
   const estTime = distData.estTime;
   const dist = distData.distance;
 
+  const fromPin = Number(fromPincode);
+  const toPin = Number(toPincode);
+
   try {
-    const tiedUpCompanies = await usertransporterrelationshipModel.find({
-      customerID,
-    });
-    const transporterData = await transporterModel.find();
+    // ── DB fetches timed & optimized ─────────────────────────────────────────
+    console.time(`[${rid}] DB tiedUpCompanies`);
+    const tiedUpCompanies = await usertransporterrelationshipModel
+      .find({ customerID })
+      .select("customerID transporterId prices") // only what we use
+      .lean()
+      .maxTimeMS(20000);
+    console.timeEnd(`[${rid}] DB tiedUpCompanies`);
+    console.log(`[${rid}] tiedUpCompanies: ${tiedUpCompanies.length}`);
+
+    console.time(`[${rid}] DB customer`);
+    const customerData = await customerModel
+      .findById(customerID)
+      .select("isSubscribed")
+      .lean()
+      .maxTimeMS(15000);
+    console.timeEnd(`[${rid}] DB customer`);
+    if (!customerData) {
+      return res.status(404).json({ success: false, message: "Customer not found" });
+    }
+    const isSubscribed = !!customerData.isSubscribed;
+
+    // Fetch *only* transporters that service both pincodes and only keep those two service entries
+    console.time(`[${rid}] DB transporters`);
+    const transporterData = await transporterModel
+      .aggregate([
+        {
+          $match: {
+            service: {
+              $all: [
+                { $elemMatch: { pincode: fromPin } },
+                { $elemMatch: { pincode: toPin } },
+              ],
+            },
+          },
+        },
+        {
+          $project: {
+            companyName: 1,
+            // Keep only the two relevant service rows to cut payload
+            service: {
+              $filter: {
+                input: "$service",
+                as: "s",
+                cond: {
+                  $or: [
+                    { $eq: ["$$s.pincode", fromPin] },
+                    { $eq: ["$$s.pincode", toPin] },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      ])
+      .allowDiskUse(true)
+      .exec();
+    console.timeEnd(`[${rid}] DB transporters`);
+    console.log(`[${rid}] candidate transporters: ${transporterData.length}`);
+
     let l1 = Number.MAX_SAFE_INTEGER;
 
-    // Build tied-up results, skip zero-price
+    // ── Tied-up companies (usually small set) ────────────────────────────────
+    console.time(`[${rid}] BUILD tiedUpResult`);
     const tiedUpRaw = await Promise.all(
       tiedUpCompanies.map(async (tuc) => {
-        const doesExist = tuc.prices.priceChart[fromPincode];
+        // Fetch only needed fields from transporter
+        console.time(`[${rid}] DB transporterById ${tuc.transporterId}`);
+        const transporter = await transporterModel
+          .findById(tuc.transporterId)
+          .select("companyName service")
+          .lean()
+          .maxTimeMS(15000);
+        console.timeEnd(`[${rid}] DB transporterById ${tuc.transporterId}`);
+        if (!transporter) return null;
+
+        const doesExist = tuc.prices?.priceChart?.[fromPincode];
         if (!doesExist) return null;
-        const transporter = await transporterModel.findById(tuc.transporterId);
-        const matchedService = transporter.service.find(
-          (entry) => entry.pincode === Number(fromPincode)
+
+        const matchedService = transporter.service?.find(
+          (entry) => entry.pincode === fromPin
         );
         if (!matchedService || matchedService.isOda) return null;
-        const matchedDest = transporter.service.find(
-          (entry) => entry.pincode === Number(toPincode)
+
+        const matchedDest = transporter.service?.find(
+          (entry) => entry.pincode === toPin
         );
         if (!matchedDest) return null;
+
         const destZone = matchedDest.zone;
         const destIsOda = matchedDest.isOda;
-        const unitPrice = tuc.prices.priceChart[fromPincode][destZone];
+        const unitPrice = tuc.prices.priceChart[fromPincode]?.[destZone];
         if (!unitPrice) return null;
+
         const pr = tuc.prices.priceRate || {};
         const kFactor = pr.kFactor ?? pr.divisor ?? 5000;
-        
-        // --- MODIFIED: Volumetric weight calculation with Math.ceil() ---
+
+        // Volumetric weight (ceil per item)
         let volumetricWeight = 0;
         if (Array.isArray(shipment_details) && shipment_details.length > 0) {
           volumetricWeight = shipment_details.reduce((sum, item) => {
-            const volWeightForItem = ((item.length || 0) * (item.width || 0) * (item.height || 0) * (item.count || 0)) / kFactor;
-            // Round UP for each item type before adding to the sum
+            const volWeightForItem =
+              ((item.length || 0) *
+                (item.width || 0) *
+                (item.height || 0) *
+                (item.count || 0)) /
+              kFactor;
             return sum + Math.ceil(volWeightForItem);
           }, 0);
         } else {
-          const volWeightForLegacy = ((length || 0) * (width || 0) * (height || 0) * (noofboxes || 0)) / kFactor;
+          const volWeightForLegacy =
+            ((length || 0) *
+              (width || 0) *
+              (height || 0) *
+              (noofboxes || 0)) /
+            kFactor;
           volumetricWeight = Math.ceil(volWeightForLegacy);
         }
 
         const chargeableWeight = Math.max(volumetricWeight, actualWeight);
         const baseFreight = unitPrice * chargeableWeight;
-        const docketCharge = pr.docketCharges;
-        const minCharges = pr.minCharges;
-        const greenTax = pr.greenTax;
-        const daccCharges = pr.daccCharges;
-        const miscCharges = pr.miscellanousCharges;
-        const fuelCharges = (pr.fuel / 100) * baseFreight;
+        const docketCharge = pr.docketCharges || 0;
+        const minCharges = pr.minCharges || 0;
+        const greenTax = pr.greenTax || 0;
+        const daccCharges = pr.daccCharges || 0;
+        const miscCharges = pr.miscellanousCharges || 0;
+        const fuelCharges = ((pr.fuel || 0) / 100) * baseFreight;
         const rovCharges = Math.max(
-          (pr.rovCharges.variable / 100) * baseFreight,
-          pr.rovCharges.fixed
+          ((pr.rovCharges?.variable || 0) / 100) * baseFreight,
+          pr.rovCharges?.fixed || 0
         );
         const insuaranceCharges = Math.max(
-          (pr.insuaranceCharges.variable / 100) * baseFreight,
-          pr.insuaranceCharges.fixed
+          ((pr.insuaranceCharges?.variable || 0) / 100) * baseFreight,
+          pr.insuaranceCharges?.fixed || 0
         );
         const odaCharges = destIsOda
-          ? pr.odaCharges.fixed + chargeableWeight * (pr.odaCharges.variable / 100)
+          ? (pr.odaCharges?.fixed || 0) +
+            chargeableWeight * ((pr.odaCharges?.variable || 0) / 100)
           : 0;
         const handlingCharges =
-          pr.handlingCharges.fixed +
-          chargeableWeight * (pr.handlingCharges.variable / 100);
+          (pr.handlingCharges?.fixed || 0) +
+          chargeableWeight * ((pr.handlingCharges?.variable || 0) / 100);
         const fmCharges = Math.max(
-          (pr.fmCharges.variable / 100) * baseFreight,
-          pr.fmCharges.fixed
+          ((pr.fmCharges?.variable || 0) / 100) * baseFreight,
+          pr.fmCharges?.fixed || 0
         );
         const appointmentCharges = Math.max(
-          (pr.appointmentCharges.variable / 100) * baseFreight,
-          pr.appointmentCharges.fixed
+          ((pr.appointmentCharges?.variable || 0) / 100) * baseFreight,
+          pr.appointmentCharges?.fixed || 0
         );
+
         const totalCharges =
           baseFreight +
           docketCharge +
@@ -216,7 +314,9 @@ export const calculatePrice = async (req, res) => {
           handlingCharges +
           fmCharges +
           appointmentCharges;
+
         l1 = Math.min(l1, totalCharges);
+
         return {
           companyId: transporter._id,
           companyName: transporter.companyName,
@@ -247,30 +347,33 @@ export const calculatePrice = async (req, res) => {
       })
     );
     const tiedUpResult = tiedUpRaw.filter((r) => r);
+    console.timeEnd(`[${rid}] BUILD tiedUpResult`);
+    console.log(`[${rid}] tiedUpResult count: ${tiedUpResult.length}`);
 
-    // Build public transporter results
+    // ── Public transporter results ───────────────────────────────────────────
+    console.time(`[${rid}] BUILD transporterResult`);
     const transporterRaw = await Promise.all(
       transporterData.map(async (data) => {
-        
         console.log(`\n--- [CHECKING] Transporter: ${data.companyName} ---`);
 
-        const customerData = await customerModel.findOne({ _id: customerID });
-        if (!customerData) return null;
-        const isSubscribed = customerData.isSubscribed;
-
-        const matchedOrigin = data.service.find(
-          (entry) => entry.pincode === Number(fromPincode)
+        // Using filtered service array (only origin/dest entries)
+        const matchedOrigin = data.service?.find(
+          (entry) => entry.pincode === fromPin
         );
         if (!matchedOrigin || matchedOrigin.isOda) {
-          console.log(`-> [REJECTED] Reason: Origin pincode ${fromPincode} is not serviceable or is ODA.`);
+          console.log(
+            `-> [REJECTED] Reason: Origin pincode ${fromPincode} is not serviceable or is ODA.`
+          );
           return null;
         }
 
-        const matchedDest = data.service.find(
-          (entry) => entry.pincode === Number(toPincode)
+        const matchedDest = data.service?.find(
+          (entry) => entry.pincode === toPin
         );
         if (!matchedDest) {
-          console.log(`-> [REJECTED] Reason: Destination pincode ${toPincode} is not serviceable.`);
+          console.log(
+            `-> [REJECTED] Reason: Destination pincode ${toPincode} is not serviceable.`
+          );
           return null;
         }
 
@@ -278,66 +381,87 @@ export const calculatePrice = async (req, res) => {
         const destZone = matchedDest.zone;
         const destOda = matchedDest.isOda;
 
-        const priceData = await priceModel.findOne({ companyId: data._id });
+        // Price doc per transporter (project only required fields)
+        console.time(`[${rid}] DB priceModel ${data._id}`);
+        const priceData = await priceModel
+          .findOne({ companyId: data._id })
+          .select("priceRate zoneRates")
+          .lean()
+          .maxTimeMS(15000);
+        console.timeEnd(`[${rid}] DB priceModel ${data._id}`);
         if (!priceData) {
-          console.log(`-> [REJECTED] Reason: No price document found in the database.`);
+          console.log(
+            `-> [REJECTED] Reason: No price document found in the database.`
+          );
           return null;
         }
-        
+
         const pr = priceData.priceRate || {};
-        const priceChart = priceData.zoneRates;
-        const unitPrice = priceChart.get(originZone)?.[destZone];
+        const unitPrice = getUnitPriceFromChart(priceData.zoneRates, originZone, destZone);
 
         if (!unitPrice) {
-          console.log(`-> [REJECTED] Reason: No unit price found for route between zone ${originZone} and ${destZone}.`);
+          console.log(
+            `-> [REJECTED] Reason: No unit price found for route between zone ${originZone} and ${destZone}.`
+          );
           return null;
         }
 
         const kFactor = pr.kFactor ?? pr.divisor ?? 5000;
-        
-        // --- MODIFIED: Volumetric weight calculation with Math.ceil() ---
+
+        // Volumetric weight (ceil per item)
         let volumetricWeight = 0;
         if (Array.isArray(shipment_details) && shipment_details.length > 0) {
           volumetricWeight = shipment_details.reduce((sum, item) => {
-            const volWeightForItem = ((item.length || 0) * (item.width || 0) * (item.height || 0) * (item.count || 0)) / kFactor;
-            // Round UP for each item type before adding to the sum
+            const volWeightForItem =
+              ((item.length || 0) *
+                (item.width || 0) *
+                (item.height || 0) *
+                (item.count || 0)) /
+              kFactor;
             return sum + Math.ceil(volWeightForItem);
           }, 0);
         } else {
-          const volWeightForLegacy = ((length || 0) * (width || 0) * (height || 0) * (noofboxes || 0)) / kFactor;
+          const volWeightForLegacy =
+            ((length || 0) *
+              (width || 0) *
+              (height || 0) *
+              (noofboxes || 0)) /
+            kFactor;
           volumetricWeight = Math.ceil(volWeightForLegacy);
         }
-        
+
         const chargeableWeight = Math.max(volumetricWeight, actualWeight);
         const baseFreight = unitPrice * chargeableWeight;
-        const docketCharge = pr.docketCharges;
-        const minCharges = pr.minCharges;
-        const greenTax = pr.greenTax;
-        const daccCharges = pr.daccCharges;
-        const miscCharges = pr.miscellanousCharges;
-        const fuelCharges = (pr.fuel / 100) * baseFreight;
+        const docketCharge = pr.docketCharges || 0;
+        const minCharges = pr.minCharges || 0;
+        const greenTax = pr.greenTax || 0;
+        const daccCharges = pr.daccCharges || 0;
+        const miscCharges = pr.miscellanousCharges || 0;
+        const fuelCharges = ((pr.fuel || 0) / 100) * baseFreight;
         const rovCharges = Math.max(
-          (pr.rovCharges.variable / 100) * baseFreight,
-          pr.rovCharges.fixed
+          ((pr.rovCharges?.variable || 0) / 100) * baseFreight,
+          pr.rovCharges?.fixed || 0
         );
         const insuaranceCharges = Math.max(
-          (pr.insuaranceCharges.variable / 100) * baseFreight,
-          pr.insuaranceCharges.fixed
+          ((pr.insuaranceCharges?.variable || 0) / 100) * baseFreight,
+          pr.insuaranceCharges?.fixed || 0
         );
         const odaCharges = destOda
-          ? pr.odaCharges.fixed + chargeableWeight * (pr.odaCharges.variable / 100)
+          ? (pr.odaCharges?.fixed || 0) +
+            chargeableWeight * ((pr.odaCharges?.variable || 0) / 100)
           : 0;
         const handlingCharges =
-          pr.handlingCharges.fixed +
-          chargeableWeight * (pr.handlingCharges.variable / 100);
+          (pr.handlingCharges?.fixed || 0) +
+          chargeableWeight * ((pr.handlingCharges?.variable || 0) / 100);
         const fmCharges = Math.max(
-          (pr.fmCharges.variable / 100) * baseFreight,
-          pr.fmCharges.fixed
+          ((pr.fmCharges?.variable || 0) / 100) * baseFreight,
+          pr.fmCharges?.fixed || 0
         );
         const appointmentCharges = Math.max(
-          (pr.appointmentCharges.variable / 100) * baseFreight,
-          pr.appointmentCharges.fixed
+          ((pr.appointmentCharges?.variable || 0) / 100) * baseFreight,
+          pr.appointmentCharges?.fixed || 0
         );
+
         const totalCharges =
           baseFreight +
           docketCharge +
@@ -353,10 +477,16 @@ export const calculatePrice = async (req, res) => {
           fmCharges +
           appointmentCharges;
 
-        console.log(`-> [SUCCESS] Quote calculated. Chargeable Weight: ${chargeableWeight.toFixed(2)}kg, Total: ${totalCharges.toFixed(2)}`);
+        console.log(
+          `-> [SUCCESS] Quote calculated. Chargeable Weight: ${chargeableWeight.toFixed(
+            2
+          )}kg, Total: ${totalCharges.toFixed(2)}`
+        );
 
         if (l1 < totalCharges) return null;
+
         if (!isSubscribed) {
+          // still compute but hide
           return { totalCharges, isHidden: true };
         }
 
@@ -390,6 +520,8 @@ export const calculatePrice = async (req, res) => {
       })
     );
     const transporterResult = transporterRaw.filter((r) => r);
+    console.timeEnd(`[${rid}] BUILD transporterResult`);
+    console.log(`[${rid}] transporterResult count: ${transporterResult.length}`);
 
     return res.status(200).json({
       success: true,
@@ -497,7 +629,7 @@ export const addTiedUpCompany = async (req, res) => {
         noofreviews: 1,
         rating: rating,
       };
-      const data = await new ratingModel(ratingPayload).save();
+      await new ratingModel(ratingPayload).save();
     } else {
       let ratingSum = ratingData.sum;
       let ratingReviews = ratingData.noofreviews;
