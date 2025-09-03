@@ -3,6 +3,11 @@ import express from "express";
 import morgan from "morgan";
 import cors from "cors";
 import dotenv from "dotenv";
+import v8 from "v8";
+import axios from "axios";
+import { AsyncLocalStorage } from "async_hooks";
+import { monitorEventLoopDelay } from "perf_hooks";
+import { randomUUID } from "crypto";
 
 import connectDatabase from "./db/db.js";
 import adminRoute from "./routes/adminRoute.js";
@@ -22,26 +27,64 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-// ─── MIDDLEWARE ─────────────────────────────────────────────────────────────
-app.use(morgan("dev"));
+// ───────────────────────── BOOT LOGS & HEALTH METRICS ───────────────────────
+console.log(
+  `BOOT: starting ${new Date().toISOString()} (node ${process.version}, pid ${process.pid})`
+);
+const heapLimitMB = Math.round(v8.getHeapStatistics().heap_size_limit / 1024 / 1024);
+console.log(`BOOT: V8 heap limit ~${heapLimitMB} MB (NODE_OPTIONS may affect this)`);
 
-// ✅ CORS allowlist (no trailing slashes)
+// Event loop lag & memory pulse (helps spot GC pauses / pressure)
+const loop = monitorEventLoopDelay({ resolution: 20 });
+loop.enable();
+setInterval(() => {
+  const mem = process.memoryUsage();
+  const rss = (mem.rss / 1048576).toFixed(0);
+  const heapUsed = (mem.heapUsed / 1048576).toFixed(0);
+  const p95 = (loop.percentile(95) / 1e6).toFixed(1);
+  console.log(`health: rss=${rss}MB heapUsed=${heapUsed}MB heapLimit=${heapLimitMB}MB lag_p95=${p95}ms`);
+}, 15000).unref();
+
+// ───────────────────────── REQUEST CONTEXT & TIMING ─────────────────────────
+const als = new AsyncLocalStorage();
+
+// Attach per-request id + latency log
+app.use((req, res, next) => {
+  const id = req.headers["x-request-id"] || randomUUID();
+  req.id = id;
+  res.setHeader("X-Request-ID", id);
+
+  const start = process.hrtime.bigint();
+  als.run({ reqId: id, start }, () => {
+    console.log(`[${id}] --> ${req.method} ${req.originalUrl}`);
+    res.on("finish", () => {
+      const durMs = Number(process.hrtime.bigint() - start) / 1e6;
+      console.log(`[${id}] <-- ${res.statusCode} ${req.method} ${req.originalUrl} ${durMs.toFixed(1)} ms`);
+    });
+    next();
+  });
+});
+
+// Morgan (keep your dev log; plus add ID token if you want)
+morgan.token("id", (req) => req.id || "-");
+app.use(morgan(":date[iso] :id :method :url :status :res[content-length] - :response-time ms"));
+
+// ────────────────────────────── CORS (with logs) ─────────────────────────────
 const STATIC_ALLOWED = [
   "http://localhost:3000",
   "http://localhost:5173",
   "https://tester-frontend-34h73mybs-testforus12-cybers-projects.vercel.app",
   "http://127.0.0.1:3000",
-"http://localhost:5173",
-"http://127.0.0.1:5173",
-"https://newtesterfrontend.netlify.app",
-"https://tester-frontend-bxo2-3h45p0xjm-testforus12-cybers-projects.vercel.app",
-"https://tester-frontend-blue.vercel.app"
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "https://newtesterfrontend.netlify.app",
+  "https://tester-frontend-bxo2-3h45p0xjm-testforus12-cybers-projects.vercel.app",
+  "https://tester-frontend-blue.vercel.app",
 ];
 
-// Optional: add more origins via env as a comma-separated list
 const EXTRA_ALLOWED = (process.env.CLIENT_ORIGINS || process.env.CLIENT_ORIGIN || "")
   .split(",")
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
 const ALLOWED_ORIGINS = new Set([...STATIC_ALLOWED, ...EXTRA_ALLOWED]);
@@ -49,22 +92,29 @@ const ALLOWED_ORIGINS = new Set([...STATIC_ALLOWED, ...EXTRA_ALLOWED]);
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow same-origin / curl / server-to-server (no Origin header)
-      if (!origin) return cb(null, true);
-
-      // exact allowlist match
-      if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
-
-      // optional: allow any vercel.app subdomain (comment out if you want it stricter)
+      const log = (msg) => console.log(`[CORS] ${msg}${origin ? ` (${origin})` : ""}`);
+      if (!origin) {
+        log("No Origin header → allow");
+        return cb(null, true);
+      }
+      if (ALLOWED_ORIGINS.has(origin)) {
+        log("✓ allow (exact match)");
+        return cb(null, true);
+      }
       try {
         const host = new URL(origin).hostname;
-        if (host.endsWith(".vercel.app")) return cb(null, true);
-      } catch { /* ignore bad origins */ }
-
+        if (host.endsWith(".vercel.app")) {
+          log("~ allow (*.vercel.app)");
+          return cb(null, true);
+        }
+      } catch {
+        log("⚠️ bad Origin header");
+      }
+      log("✗ block");
       return cb(new Error("Not allowed by CORS"));
     },
     credentials: true,
-    optionsSuccessStatus: 200, // helps some proxies/browsers with preflight
+    optionsSuccessStatus: 200,
   })
 );
 
@@ -75,16 +125,64 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.get("/", (_req, res) => res.send("API is running"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// ─── DATABASE ────────────────────────────────────────────────────────────────
+// ──────────────────────────── AXIOS TIMING LOGS ──────────────────────────────
+function attachAxiosLogging(instance) {
+  instance.interceptors.request.use(
+    (config) => {
+      config.metadata = { start: Date.now() };
+      const store = als.getStore();
+      if (store?.reqId) {
+        config.headers = { ...(config.headers || {}), "x-request-id": store.reqId };
+      }
+      const rid = store?.reqId || "-";
+      console.log(`[${rid}] axios --> ${String(config.method).toUpperCase()} ${config.url}`);
+      return config;
+    },
+    (error) => {
+      console.log(`axios request setup error: ${error.message}`);
+      return Promise.reject(error);
+    }
+  );
+
+  instance.interceptors.response.use(
+    (res) => {
+      const dur = Date.now() - (res.config.metadata?.start || Date.now());
+      const rid = als.getStore()?.reqId || "-";
+      console.log(`[${rid}] axios <-- ${res.status} ${String(res.config.method).toUpperCase()} ${res.config.url} ${dur}ms`);
+      return res;
+    },
+    (err) => {
+      const cfg = err.config || {};
+      const dur = cfg.metadata ? Date.now() - cfg.metadata.start : -1;
+      const rid = als.getStore()?.reqId || "-";
+      const status = err.response?.status || 0;
+      console.log(
+        `[${rid}] axios ERR ${status} ${String(cfg.method).toUpperCase()} ${cfg.url} after ${dur}ms: ${err.code || err.message}`
+      );
+      return Promise.reject(err);
+    }
+  );
+}
+attachAxiosLogging(axios);
+// Ensure axios.create() instances also get the same logging
+const _create = axios.create.bind(axios);
+axios.create = function (config) {
+  const inst = _create(config);
+  attachAxiosLogging(inst);
+  return inst;
+};
+
+// ───────────────────────────── DATABASE CONNECT ──────────────────────────────
 console.log("🔌 Connecting to database...");
+const dbT0 = Date.now();
 connectDatabase()
-  .then(() => console.log("✅ Database connected successfully"))
+  .then(() => console.log(`✅ Database connected successfully in ${Date.now() - dbT0} ms`))
   .catch((err) => {
     console.error("❌ Database connection failed:", err);
     process.exit(1);
   });
 
-// ─── ROUTES ──────────────────────────────────────────────────────────────────
+// ───────────────────────────────── ROUTES ────────────────────────────────────
 app.use("/api/auth", authRoute);
 app.use("/api/transporter", transporterRoute);
 app.use("/api/admin", adminRoute);
@@ -100,23 +198,41 @@ app.post("/upload", async (req, res) => {
     return res.status(400).json({ success: false, error: "No records provided" });
   }
   try {
-    console.log("Received records:", records.length);
+    console.log(`[${req.id}] /upload received records: ${records.length}`);
     return res.json({ success: true });
   } catch (err) {
-    console.error(err);
+    console.error(`[${req.id}] /upload error:`, err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ─── START SERVER ────────────────────────────────────────────────────────────
+// Global error handler (ensures stack traces are logged once)
+app.use((err, req, res, _next) => {
+  console.error(`[${req?.id || "-"}] Unhandled error:`, err && err.stack ? err.stack : err);
+  if (!res.headersSent) {
+    res.status(500).json({ success: false, error: "Internal Server Error" });
+  }
+});
+
+// ───────────────────────────── START SERVER ──────────────────────────────────
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server started on port ${PORT}`);
   console.log("📋 Available routes:");
   console.log("  - POST /api/vendor/wheelseye-pricing");
   console.log("  - POST /api/vendor/wheelseye-distance");
   console.log("  - GET  /api/wheelseye/pricing");
+  console.log(`==> Available at your primary URL after boot`);
 });
 
+// Process-level safety nets
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+
+// Graceful shutdown
 process.on("SIGINT", () => {
   console.log("\n🛑 Shutting down server...");
   server.close(() => {
