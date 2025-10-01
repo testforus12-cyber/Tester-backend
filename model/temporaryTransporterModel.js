@@ -43,6 +43,21 @@ const temporaryTransporterModel = new mongoose.Schema(
       type: Number,
       required: true,
     },
+    city: {
+      type: String,
+      default: "",
+    },
+    rating: {
+      type: Number,
+      default: 3,
+    },
+    subVendor: {
+      type: String,
+      default: "",
+    },
+    selectedZones: [{
+      type: String,
+    }],
     prices: 
       {
         priceRate: {
