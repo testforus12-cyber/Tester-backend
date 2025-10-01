@@ -350,6 +350,144 @@ export const calculatePrice = async (req, res) => {
     console.timeEnd(`[${rid}] BUILD tiedUpResult`);
     console.log(`[${rid}] tiedUpResult count: ${tiedUpResult.length}`);
 
+    // ── Temporary transporters (from Add Vendor) ──────────────────────────────
+    console.time(`[${rid}] DB temporaryTransporters`);
+    const temporaryTransporters = await temporaryTransporterModel
+      .find({ customerID })
+      .select("customerID companyName vendorCode prices selectedZones")
+      .lean()
+      .maxTimeMS(20000);
+    console.timeEnd(`[${rid}] DB temporaryTransporters`);
+    console.log(`[${rid}] temporaryTransporters: ${temporaryTransporters.length}`);
+
+    console.time(`[${rid}] BUILD temporaryTransporterResult`);
+    const temporaryTransporterRaw = await Promise.all(
+      temporaryTransporters.map(async (tempTransporter) => {
+        // For temporary transporters, we need to find a zone that works for both origin and destination
+        // Since temporary transporters use zone-based pricing, we'll use a simple approach
+        const priceChart = tempTransporter.prices?.priceChart;
+        if (!priceChart) return null;
+
+        // Get all available zones from the price chart
+        const availableZones = Object.keys(priceChart);
+        if (!availableZones.length) return null;
+
+        // For now, we'll use the first available zone as both origin and destination
+        // This is a simplified approach - in a real system, you'd need proper pincode-to-zone mapping
+        const originZone = availableZones[0];
+        const destZone = availableZones[0];
+        
+        // Get the unit price for this zone combination
+        const zonePricing = priceChart[originZone];
+        if (!zonePricing) return null;
+        
+        const unitPrice = zonePricing[destZone];
+        if (!unitPrice) return null;
+
+        const pr = tempTransporter.prices.priceRate || {};
+        const kFactor = pr.kFactor ?? pr.divisor ?? 5000;
+
+        // Volumetric weight (ceil per item)
+        let volumetricWeight = 0;
+        if (Array.isArray(shipment_details) && shipment_details.length > 0) {
+          volumetricWeight = shipment_details.reduce((sum, item) => {
+            const volWeightForItem =
+              ((item.length || 0) *
+                (item.width || 0) *
+                (item.height || 0) *
+                (item.count || 0)) /
+              kFactor;
+            return sum + Math.ceil(volWeightForItem);
+          }, 0);
+        } else {
+          const volWeightForLegacy =
+            ((length || 0) *
+              (width || 0) *
+              (height || 0) *
+              (noofboxes || 0)) /
+            kFactor;
+          volumetricWeight = Math.ceil(volWeightForLegacy);
+        }
+
+        const chargeableWeight = Math.max(volumetricWeight, actualWeight);
+        const baseFreight = unitPrice * chargeableWeight;
+        const docketCharge = pr.docketCharges || 0;
+        const minCharges = pr.minCharges || 0;
+        const greenTax = pr.greenTax || 0;
+        const daccCharges = pr.daccCharges || 0;
+        const miscCharges = pr.miscellanousCharges || 0;
+        const fuelCharges = ((pr.fuel || 0) / 100) * baseFreight;
+        const rovCharges = Math.max(
+          ((pr.rovCharges?.variable || 0) / 100) * baseFreight,
+          pr.rovCharges?.fixed || 0
+        );
+        const insuaranceCharges = Math.max(
+          ((pr.insuaranceCharges?.variable || 0) / 100) * baseFreight,
+          pr.insuaranceCharges?.fixed || 0
+        );
+        const odaCharges = 0; // Temporary transporters don't have ODA logic
+        const handlingCharges =
+          (pr.handlingCharges?.fixed || 0) +
+          chargeableWeight * ((pr.handlingCharges?.variable || 0) / 100);
+        const fmCharges = Math.max(
+          ((pr.fmCharges?.variable || 0) / 100) * baseFreight,
+          pr.fmCharges?.fixed || 0
+        );
+        const appointmentCharges = Math.max(
+          ((pr.appointmentCharges?.variable || 0) / 100) * baseFreight,
+          pr.appointmentCharges?.fixed || 0
+        );
+
+        const totalCharges =
+          baseFreight +
+          docketCharge +
+          minCharges +
+          greenTax +
+          daccCharges +
+          miscCharges +
+          fuelCharges +
+          rovCharges +
+          insuaranceCharges +
+          odaCharges +
+          handlingCharges +
+          fmCharges +
+          appointmentCharges;
+
+        return {
+          companyId: tempTransporter._id,
+          companyName: tempTransporter.companyName,
+          vendorCode: tempTransporter.vendorCode,
+          originPincode: fromPincode,
+          destinationPincode: toPincode,
+          estimatedTime: estTime,
+          distance: dist,
+          actualWeight: parseFloat(actualWeight.toFixed(2)),
+          volumetricWeight: parseFloat(volumetricWeight.toFixed(2)),
+          chargeableWeight: parseFloat(chargeableWeight.toFixed(2)),
+          unitPrice,
+          baseFreight,
+          docketCharge,
+          minCharges,
+          greenTax,
+          daccCharges,
+          miscCharges,
+          fuelCharges,
+          rovCharges,
+          insuaranceCharges,
+          odaCharges,
+          handlingCharges,
+          fmCharges,
+          appointmentCharges,
+          totalCharges,
+          isHidden: false,
+          isTemporaryTransporter: true,
+        };
+      })
+    );
+    const temporaryTransporterResult = temporaryTransporterRaw.filter((r) => r);
+    console.timeEnd(`[${rid}] BUILD temporaryTransporterResult`);
+    console.log(`[${rid}] temporaryTransporterResult count: ${temporaryTransporterResult.length}`);
+
     // ── Public transporter results ───────────────────────────────────────────
     console.time(`[${rid}] BUILD transporterResult`);
     const transporterRaw = await Promise.all(
@@ -523,10 +661,13 @@ export const calculatePrice = async (req, res) => {
     console.timeEnd(`[${rid}] BUILD transporterResult`);
     console.log(`[${rid}] transporterResult count: ${transporterResult.length}`);
 
+    // Combine tied-up results with temporary transporter results
+    const allTiedUpResults = [...tiedUpResult, ...temporaryTransporterResult];
+
     return res.status(200).json({
       success: true,
       message: "Price calculated successfully",
-      tiedUpResult,
+      tiedUpResult: allTiedUpResults,
       companyResult: transporterResult,
     });
   } catch (err) {
@@ -549,12 +690,16 @@ export const addTiedUpCompany = async (req, res) => {
       mode,
       address,
       state,
+      city,
       pincode,
       rating,
       companyName,
+      subVendor,
       priceRate,
       priceChart,
+      selectedZones,
     } = req.body;
+    
     if (
       (!customerID,
       !vendorCode,
@@ -573,82 +718,60 @@ export const addTiedUpCompany = async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          "customerID, companyName, priceRate and priceChart file are all required",
+          "customerID, companyName, priceRate and priceChart are all required",
       });
     }
 
-    const companyId = await transporterModel.findOne({ companyName: companyName });
-    if (!companyId) {
-      const tempData = new temporaryTransporterModel({
-        customerID: customerID,
-        companyName: companyName,
-        vendorCode: vendorCode,
-        vendorPhone: vendorPhone,
-        vendorEmail: vendorEmail,
-        gstNo: gstNo,
-        mode: mode,
-        address: address,
-        state: state,
-        pincode: pincode,
-        prices: {
-          priceRate: priceRate,
-          priceChart: priceChart,
-        },
-      }).save();
-      if (tempData) {
-        return res.status(201).json({
-          success: true,
-          message: "Company added for verification",
-        });
-      }
+    // Check if this vendor already exists for this customer in temporary transporters
+    const existingTempVendor = await temporaryTransporterModel.findOne({
+      customerID: customerID,
+      companyName: companyName,
+      vendorCode: vendorCode,
+    });
+
+    if (existingTempVendor) {
+      return res.status(400).json({
+        success: false,
+        message: "This vendor already exists for your account",
+      });
     }
 
-    const newDoc = new usertransporterrelationshipModel({
+    // Always save to temporary transporters for Add Vendor functionality
+    const tempData = await new temporaryTransporterModel({
       customerID: customerID,
-      transporterId: companyId._id,
+      companyName: companyName,
+      vendorCode: vendorCode,
+      vendorPhone: vendorPhone,
+      vendorEmail: vendorEmail,
+      gstNo: gstNo,
+      mode: mode,
+      address: address,
+      state: state,
+      city: city || "",
+      pincode: pincode,
+      rating: rating,
+      subVendor: subVendor || "",
+      selectedZones: selectedZones || [],
       prices: {
-        vendorCode: vendorCode,
-        vendorPhone: vendorPhone,
-        vendorEmail: vendorEmail,
-        gstNo: gstNo,
-        mode: mode,
-        address: address,
-        state: state,
-        pincode: pincode,
         priceRate: priceRate,
         priceChart: priceChart,
       },
-    });
-    await newDoc.save();
+    }).save();
 
-    const ratingData = await ratingModel.findOne({ companyId: companyId._id });
-    if (!ratingData) {
-      const ratingPayload = {
-        companyId: companyId._id,
-        sum: rating,
-        noofreviews: 1,
-        rating: rating,
-      };
-      await new ratingModel(ratingPayload).save();
+    if (tempData) {
+      return res.status(201).json({
+        success: true,
+        message: "Vendor added successfully to your tied-up vendors",
+        data: tempData,
+      });
     } else {
-      let ratingSum = ratingData.sum;
-      let ratingReviews = ratingData.noofreviews;
-      ratingSum += rating;
-      ratingReviews += 1;
-      const newRating = ratingSum / ratingReviews;
-
-      ratingData.sum = ratingSum;
-      ratingData.noofreviews = ratingReviews;
-      ratingData.rating = newRating;
-      await ratingData.save();
+      return res.status(500).json({
+        success: false,
+        message: "Failed to save vendor",
+      });
     }
-
-    return res.status(200).json({
-      success: true,
-      message: "Tied up company added successfully",
-    });
   } catch (err) {
-    console.error(err);
+    console.error("Error in addTiedUpCompany:", err);
     return res.status(500).json({
       success: false,
       message: "Server error",
@@ -669,6 +792,35 @@ export const getTiedUpCompanies = async (req, res) => {
     });
   } catch (error) {
     console.error(error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error",
+    });
+  }
+};
+
+export const getTemporaryTransporters = async (req, res) => {
+  try {
+    const { customerID } = req.query;
+    
+    if (!customerID) {
+      return res.status(400).json({
+        success: false,
+        message: "Customer ID is required",
+      });
+    }
+
+    const temporaryTransporters = await temporaryTransporterModel.find({
+      customerID: customerID,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Temporary transporters fetched successfully",
+      data: temporaryTransporters,
+    });
+  } catch (error) {
+    console.error("Error fetching temporary transporters:", error);
     return res.status(500).json({
       success: false,
       message: "Server error",
@@ -716,6 +868,46 @@ export const getAllTransporters = async (req, res) => {
       success: false,
       message: "Server error",
     });
+  }
+};
+
+// Remove a tied-up vendor for a specific customer by company name (case-insensitive)
+export const removeTiedUpVendor = async (req, res) => {
+  try {
+    const { customerID, companyName } = req.body || {};
+    if (!customerID || !companyName) {
+      return res.status(400).json({ success: false, message: 'customerID and companyName are required' });
+    }
+
+    const nameRegex = new RegExp(`^${companyName}$`, 'i');
+
+    // Find transporter by name to remove relationships
+    const transporter = await transporterModel.findOne({ companyName: nameRegex }).select('_id');
+
+    let relDeleted = 0;
+    if (transporter?._id) {
+      const relRes = await usertransporterrelationshipModel.deleteMany({
+        customerID,
+        transporterId: transporter._id,
+      });
+      relDeleted = relRes?.deletedCount || 0;
+    }
+
+    // Remove any temporary transporters added for this customer
+    const tempRes = await temporaryTransporterModel.deleteMany({
+      customerID,
+      companyName: nameRegex,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Tied-up vendor removed',
+      removedRelationships: relDeleted,
+      removedTemporary: tempRes?.deletedCount || 0,
+    });
+  } catch (err) {
+    console.error('Error removing tied-up vendor:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
   }
 };
 
