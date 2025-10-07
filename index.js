@@ -38,6 +38,7 @@ const STATIC_ALLOWED = [
 'https://peaceful-halva-d8c713.netlify.app',
 "https://transporter-signup.netlify.app",
 'https://freightcompare.netlify.app',
+"https://tester-frontend-blue.vercel.app",
 ];
 
 // Optional: add more origins via env as a comma-separated list
