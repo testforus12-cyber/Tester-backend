@@ -27,7 +27,7 @@ dotenv.config();
 // helper: safe get unit price from various chart shapes and zone key cases
 function getUnitPriceFromPriceChart(priceChart, originZoneCode, destZoneCode) {
   if (!priceChart || !originZoneCode || !destZoneCode) return null;
-  const o = String(originZoneCode).trim().toUpperCase();
+  const o = String(originZoneCode).trim().toUpperCase(); 
   const d = String(destZoneCode).trim().toUpperCase();
 
   // common shapes:
@@ -1270,6 +1270,9 @@ export const updateVendor = async (req, res) => {
     const updateData = req.body;
     const customerID = req.customer?._id;
 
+    console.log('📝 Update vendor request:', { id, customerID });
+    console.log('📤 Update data received:', JSON.stringify(updateData, null, 2));
+
     if (!customerID) {
       return res.status(401).json({
         success: false,
@@ -1290,16 +1293,108 @@ export const updateVendor = async (req, res) => {
       });
     }
 
-    // Remove fields that shouldn't be updated directly
+    // ✅ FIXED: Don't delete prices - we want to update them!
+    // Remove only system fields that shouldn't be updated
     delete updateData._id;
     delete updateData.createdAt;
-    delete updateData.customerID;
-    delete updateData.prices; // Prices should be updated separately
+    delete updateData.__v;
+    // Keep customerID in case it's not in the payload, but don't allow changing it
+    if (updateData.customerID && updateData.customerID !== customerID.toString()) {
+      delete updateData.customerID;
+    }
 
+    // ✅ FIXED: Validate and sanitize inputs if provided
+    const validationErrors = [];
+
+    if (updateData.vendorEmail && !validateEmail(updateData.vendorEmail)) {
+      validationErrors.push("Invalid email format");
+    }
+
+    if (updateData.vendorPhone && !validatePhone(updateData.vendorPhone)) {
+      validationErrors.push("Invalid phone number format");
+    }
+
+    if (updateData.gstNo && !validateGSTIN(updateData.gstNo)) {
+      validationErrors.push("Invalid GSTIN format");
+    }
+
+    if (updateData.pincode && !validatePincode(updateData.pincode)) {
+      validationErrors.push("Invalid pincode format");
+    }
+
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: validationErrors,
+      });
+    }
+
+    // ✅ FIXED: Sanitize string inputs
+    if (updateData.companyName) {
+      updateData.companyName = sanitizeString(updateData.companyName, 100);
+    }
+    if (updateData.address) {
+      updateData.address = sanitizeString(updateData.address, 200);
+    }
+    if (updateData.state) {
+      updateData.state = sanitizeString(updateData.state, 50);
+    }
+    if (updateData.city) {
+      updateData.city = sanitizeString(updateData.city, 50);
+    }
+    if (updateData.subVendor) {
+      updateData.subVendor = sanitizeString(updateData.subVendor, 50);
+    }
+
+    // ✅ FIXED: Sanitize and validate zone matrix if provided
+    if (updateData.prices?.priceChart && updateData.selectedZones) {
+      const sanitizedZones = sanitizeZoneCodes(updateData.selectedZones);
+      const matrixValidation = validateZoneMatrix(
+        updateData.prices.priceChart, 
+        sanitizedZones
+      );
+      
+      if (!matrixValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid zone matrix",
+          errors: matrixValidation.errors,
+        });
+      }
+      
+      updateData.selectedZones = sanitizedZones;
+    }
+
+    // ✅ FIXED: Ensure numeric fields are actually numbers
+    if (updateData.vendorPhone) {
+      updateData.vendorPhone = Number(updateData.vendorPhone);
+    }
+    if (updateData.pincode) {
+      updateData.pincode = Number(updateData.pincode);
+    }
+    if (updateData.rating) {
+      updateData.rating = Number(updateData.rating);
+    }
+
+    // ✅ FIXED: Normalize email and GST
+    if (updateData.vendorEmail) {
+      updateData.vendorEmail = updateData.vendorEmail.trim().toLowerCase();
+    }
+    if (updateData.gstNo) {
+      updateData.gstNo = updateData.gstNo.trim().toUpperCase();
+    }
+
+    console.log('💾 Saving update to MongoDB...');
+
+    // ✅ FIXED: Use $set to update only provided fields
     const updatedVendor = await temporaryTransporterModel.findByIdAndUpdate(
       id,
-      updateData,
-      { new: true, runValidators: true }
+      { $set: updateData },
+      { 
+        new: true,           // Return updated document
+        runValidators: true  // Run schema validators
+      }
     );
 
     if (!updatedVendor) {
@@ -1309,13 +1404,15 @@ export const updateVendor = async (req, res) => {
       });
     }
 
+    console.log('✅ Vendor updated successfully in MongoDB:', updatedVendor._id);
+
     return res.status(200).json({
       success: true,
       message: "Vendor updated successfully",
       data: updatedVendor,
     });
   } catch (error) {
-    console.error("Error updating vendor:", error);
+    console.error("❌ Error updating vendor:", error);
     return res.status(500).json({
       success: false,
       message: "Server error while updating vendor",
