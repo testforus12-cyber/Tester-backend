@@ -6,8 +6,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Try to load FE pincodes.json for zone mapping; fall back to local data if provided
-const FE_PINCODES_PATH = path.join(__dirname, "../../data/pincodes.json");
-const LOCAL_PINCODES_PATH = path.join(__dirname, "../../data/pincode_centroids.json");
+const FE_PINCODES_PATH = path.join(__dirname, "../../../Tester-Frontend-main/public/pincodes.json");
+const LOCAL_PINCODES_PATH = path.join(__dirname, "../../data/pincodes_zone.json");
 
 let zoneMap = null;
 function buildZoneMap(jsonArr) {
